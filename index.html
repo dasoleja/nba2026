@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>NBA Finals 2025 · Tracker</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0E0A00; font-family: 'Segoe UI', system-ui, sans-serif; }
+    button { font-family: inherit; }
+    ::-webkit-scrollbar { display: none; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    @keyframes spin { to{transform:rotate(360deg)} }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+/* ═══════════ COLORS ═══════════ */
+const C = {
+  bg:"#0E0A00", card:"#1A1200", border:"#3D2800",
+  orange:"#FF6B00", gold:"#FFB300", red:"#FF3B30",
+  blue:"#4A9EE8", text:"#F5EFE0", muted:"#8A7A60",
+  adv:"rgba(255,107,0,0.1)", orangeBg:"rgba(255,107,0,0.1)",
+  green:"#00C853",
+};
+
+/* ═══════════ ESPN API ═══════════ */
+const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
+
+async function fetchSeries() {
+  const res = await fetch(`${ESPN_BASE}/scoreboard`);
+  const data = await res.json();
+  // Find Finals event
+  const events = data.events || [];
+  const finals = events.find(e =>
+    e.season?.slug === "post-season" ||
+    (e.name||"").toLowerCase().includes("final") ||
+    (e.competitions?.[0]?.series != null)
+  ) || events[0];
+  return finals || null;
+}
+
+async function fetchFinalsGames() {
+  // Fetch all NBA postseason games for the finals teams
+  const res = await fetch(`${ESPN_BASE}/scoreboard?limit=20&groups=50`);
+  const data = await res.json();
+  return data.events || [];
+}
+
+async function fetchGameSummary(gameId) {
+  const res = await fetch(`${ESPN_BASE}/summary?event=${gameId}`);
+  if (!res.ok) throw new Error();
+  return await res.json();
+}
+
+function parseEvent(ev) {
+  const comp = ev.competitions?.[0];
+  const home = comp?.competitors?.find(c=>c.homeAway==="home");
+  const away = comp?.competitors?.find(c=>c.homeAway==="away");
+  const status = comp?.status?.type;
+  const done = status?.completed;
+  const live = !done && status?.name !== "STATUS_SCHEDULED";
+  const hScore = (done||live) ? parseInt(home?.score||"0") : null;
+  const aScore = (done||live) ? parseInt(away?.score||"0") : null;
+  const series = comp?.series;
+  const toCDT = utc => {
+    try { return new Date(utc).toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/Chicago"})+" CDT"; }
+    catch { return "TBD"; }
+  };
+  const toDate = utc => {
+    try { return new Date(utc).toLocaleDateString("en-CA",{timeZone:"America/Chicago"}); }
+    catch { return ""; }
+  };
+  const fmtDate = utc => {
+    try { return new Date(utc).toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric",timeZone:"America/Chicago"}); }
+    catch { return ""; }
+  };
+  return {
+    id: ev.id,
+    date: toDate(ev.date),
+    dateLabel: fmtDate(ev.date),
+    time: toCDT(ev.date),
+    homeTeam: home?.team?.displayName || "TBD",
+    awayTeam: away?.team?.displayName || "TBD",
+    homeLogo: home?.team?.logo || "",
+    awayLogo: away?.team?.logo || "",
+    homeScore: hScore,
+    awayScore: aScore,
+    homeRecord: series?.competitors?.find(c=>c.homeAway==="home")?.wins || home?.records?.[0]?.summary || "",
+    awayRecord: series?.competitors?.find(c=>c.homeAway==="away")?.wins || away?.records?.[0]?.summary || "",
+    status: done?"FINAL": live?"LIVE":"UPCOMING",
+    statusDetail: comp?.status?.type?.shortDetail || "",
+    venue: comp?.venue?.fullName || "",
+    city: comp?.venue?.address?.city || "",
+    seriesHomeWins: series?.competitors?.find(c=>c.homeAway==="home")?.wins ?? null,
+    seriesAwayWins: series?.competitors?.find(c=>c.homeAway==="away")?.wins ?? null,
+    homeColor: home?.team?.color ? `#${home.team.color}` : C.orange,
+    awayColor: away?.team?.color ? `#${away.team.color}` : C.blue,
+    gameNumber: comp?.series?.gameNumber || null,
+  };
+}
+
+/* ═══════════ AI FUNCTIONS ═══════════ */
+async function callClaude(prompt) {
+  const res = await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1200,messages:[{role:"user",content:prompt}]})
+  });
+  const data = await res.json();
+  if(data.type==="error"||!data.content) throw new Error("API error");
+  return data.content?.[0]?.text || "";
+}
+
+async function generateRecap(game, summaryData) {
+  const plays = summaryData?.plays || [];
+  const boxscore = summaryData?.boxscore;
+  const leaders = summaryData?.leaders || [];
+
+  // Extract key player highlights from leaders
+  const leaderLines = leaders.flatMap(cat =>
+    (cat.leaders||[]).slice(0,1).map(l=>`${l.athlete?.displayName}: ${l.displayValue} ${cat.displayName}`)
+  ).join(", ");
+
+  // Get last 10 significant plays
+  const keyPlays = plays.filter(p=>p.scoringPlay||p.type?.text?.includes("Timeout")||p.text?.includes("record"))
+    .slice(-8).map(p=>p.text).join(" | ");
+
+  const prompt = `You are writing an NBA Finals game recap for knowledgeable basketball fans. Be technical, exciting, and insightful.
+
+Game: ${game.awayTeam} ${game.awayScore} @ ${game.homeTeam} ${game.homeScore} — FINAL
+Venue: ${game.venue}, ${game.city}
+Series: ${game.homeTeam} leads ${game.seriesHomeWins}-${game.seriesAwayWins} (or vice versa — use what makes sense)
+${leaderLines ? `Statistical leaders: ${leaderLines}` : ""}
+${keyPlays ? `Key plays/moments: ${keyPlays}` : ""}
+
+Write a 4-5 sentence recap covering:
+1. The game result and how it unfolded (was it close, a blowout, a comeback?)
+2. The standout performer(s) and what they did that was exceptional
+3. Any notable runs, momentum swings, or records broken
+4. What this result means for the series — who has the edge now and why
+Be specific, use basketball terminology, and make a fan who missed the game feel the energy of it.`;
+
+  return await callClaude(prompt);
+}
+
+async function generatePrediction(games, homeTeam, awayTeam, homeWins, awayWins) {
+  const completedGames = games.filter(g=>g.status==="FINAL");
+  const gamesSummary = completedGames.map((g,i)=>`Game ${i+1}: ${g.awayTeam} ${g.awayScore} @ ${g.homeTeam} ${g.homeScore}`).join("\n");
+  const seriesScore = `${homeTeam} ${homeWins} – ${awayWins} ${awayTeam}`;
+
+  const prompt = `You are an NBA analyst giving a sharp, informed series prediction for the NBA Finals.
+
+Current series: ${seriesScore}
+Games played:
+${gamesSummary || "Series just started"}
+
+Write 4-5 sentences covering:
+1. Who has the edge right now and why (home court, momentum, injuries, matchups)
+2. The key X-factor that will decide this series
+3. Your prediction for how the series ends — who wins and in how many games, with your reasoning
+Be confident, analytical, and specific. Use real basketball analysis, not generic commentary.`;
+
+  return await callClaude(prompt);
+}
+
+/* ═══════════ UTILS ═══════════ */
+const fmtFullDate = s => {
+  try { return new Date(s+"T12:00:00").toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"}); }
+  catch { return s; }
+};
+
+/* ═══════════ TEAM LOGO ═══════════ */
+function TeamLogo({src,name,size=48}) {
+  const [err,setErr]=useState(false);
+  if(err||!src) return <div style={{width:size,height:size,borderRadius:"50%",background:"rgba(255,107,0,.2)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:size*0.4,fontWeight:900,color:C.orange}}>{(name||"?")[0]}</div>;
+  return <img src={src} alt={name} onError={()=>setErr(true)} style={{width:size,height:size,objectFit:"contain"}}/>;
+}
+
+/* ═══════════ SERIES HEADER ═══════════ */
+function SeriesHeader({games,homeTeam,awayTeam,homeWins,awayWins,homeLogo,awayLogo}) {
+  const total = homeWins+awayWins;
+  const leader = homeWins>awayWins?homeTeam:awayWins>homeWins?awayTeam:null;
+  const leaderWins = Math.max(homeWins,awayWins);
+  const loserWins = Math.min(homeWins,awayWins);
+  const champion = leaderWins===4?leader:null;
+
+  return (
+    <div style={{background:`linear-gradient(135deg, #1A1200, #2A1800)`,border:`1px solid ${C.border}`,borderRadius:16,padding:"20px 16px",marginBottom:16,textAlign:"center"}}>
+      {champion && (
+        <div style={{background:"linear-gradient(135deg,#FFB300,#FF6B00)",borderRadius:8,padding:"6px 16px",fontSize:13,fontWeight:800,color:"#000",marginBottom:12,display:"inline-block"}}>
+          🏆 NBA CHAMPIONS
+        </div>
+      )}
+      <div style={{fontSize:11,color:C.muted,letterSpacing:2,fontWeight:700,textTransform:"uppercase",marginBottom:12}}>
+        {champion?"2025 NBA Finals":"2025 NBA Finals · Best of 7"}
+      </div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16}}>
+        <div style={{textAlign:"center",flex:1}}>
+          <TeamLogo src={awayLogo} name={awayTeam} size={56}/>
+          <div style={{fontSize:13,fontWeight:700,color:C.text,marginTop:6}}>{awayTeam}</div>
+        </div>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:36,fontWeight:900,color:C.orange,letterSpacing:2}}>
+            {awayWins} – {homeWins}
+          </div>
+          <div style={{fontSize:11,color:C.muted,marginTop:4}}>
+            {champion ? `${champion} wins!` : leader ? `${leader} leads` : "Series tied"}
+          </div>
+          <div style={{fontSize:11,color:C.muted,marginTop:2}}>Game {total} of 7</div>
+        </div>
+        <div style={{textAlign:"center",flex:1}}>
+          <TeamLogo src={homeLogo} name={homeTeam} size={56}/>
+          <div style={{fontSize:13,fontWeight:700,color:C.text,marginTop:6}}>{homeTeam}</div>
+        </div>
+      </div>
+      {/* Win pip indicators */}
+      <div style={{display:"flex",justifyContent:"center",gap:8,marginTop:14}}>
+        {[0,1,2,3].map(i=>(
+          <div key={i} style={{width:12,height:12,borderRadius:"50%",background:i<awayWins?C.orange:"rgba(255,107,0,.2)",border:`1px solid ${C.orange}`}}/>
+        ))}
+        <div style={{width:20}}/>
+        {[0,1,2,3].map(i=>(
+          <div key={i} style={{width:12,height:12,borderRadius:"50%",background:i<homeWins?C.orange:"rgba(255,107,0,.2)",border:`1px solid ${C.orange}`}}/>
+        ))}
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",paddingTop:8,fontSize:10,color:C.muted}}>
+        <span>{awayTeam}</span><span>{homeTeam}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════ GAME CARD ═══════════ */
+function GameCard({game}) {
+  const done=game.status==="FINAL";
+  const live=game.status==="LIVE";
+  return (
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 16px",marginBottom:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <span style={{background:C.orangeBg,color:C.orange,borderRadius:5,padding:"3px 8px",fontSize:11,fontWeight:700}}>
+          {game.gameNumber ? `GAME ${game.gameNumber}` : "NBA FINALS"}
+        </span>
+        <span style={{color:C.muted,fontSize:12}}>{done||live?"":game.time}</span>
+        <span style={{
+          background:live?"rgba(255,59,48,.2)":done?"rgba(0,200,83,.15)":"rgba(74,158,232,.15)",
+          color:live?C.red:done?C.green:C.blue,
+          borderRadius:4,padding:"3px 8px",fontSize:11,fontWeight:700,
+          animation:live?"pulse 1.5s infinite":""
+        }}>
+          {live?`● LIVE · ${game.statusDetail}`:done?"FINAL":"UPCOMING"}
+        </span>
+      </div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{flex:1,textAlign:"center"}}>
+          <TeamLogo src={game.awayLogo} name={game.awayTeam} size={52}/>
+          <div style={{fontSize:13,fontWeight:700,marginTop:6,color:C.text}}>{game.awayTeam}</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:2}}>Away</div>
+        </div>
+        <div style={{textAlign:"center",minWidth:100}}>
+          {done||live
+            ?<div style={{fontSize:36,fontWeight:900,color:C.text,letterSpacing:-1}}>
+                <span style={{color:game.awayScore>game.homeScore?C.orange:C.text}}>{game.awayScore}</span>
+                <span style={{color:C.muted,margin:"0 6px"}}>–</span>
+                <span style={{color:game.homeScore>game.awayScore?C.orange:C.text}}>{game.homeScore}</span>
+              </div>
+            :<div style={{fontSize:15,color:C.muted,fontWeight:600}}>{game.time}</div>}
+          {done&&<div style={{fontSize:11,color:C.muted,marginTop:4}}>{game.dateLabel}</div>}
+        </div>
+        <div style={{flex:1,textAlign:"center"}}>
+          <TeamLogo src={game.homeLogo} name={game.homeTeam} size={52}/>
+          <div style={{fontSize:13,fontWeight:700,marginTop:6,color:C.text}}>{game.homeTeam}</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:2}}>Home</div>
+        </div>
+      </div>
+      {game.venue&&<div style={{marginTop:11,textAlign:"center",color:C.muted,fontSize:12}}>🏟️ {game.venue}{game.city?`, ${game.city}`:""}</div>}
+    </div>
+  );
+}
+
+/* ═══════════ RECAP CARD ═══════════ */
+function RecapCard({game,autoLoad}) {
+  const [text,setText]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const loaded=useRef(false);
+
+  useEffect(()=>{
+    if(autoLoad&&!loaded.current&&game.status==="FINAL"){
+      loaded.current=true;
+      setLoading(true);
+      fetchGameSummary(game.id)
+        .then(summary=>generateRecap(game,summary))
+        .then(t=>{setText(t);setLoading(false);})
+        .catch(()=>{
+          // Fallback without detailed summary
+          generateRecap(game,{}).then(t=>{setText(t);setLoading(false);}).catch(()=>setLoading(false));
+        });
+    }
+  },[game,autoLoad]);
+
+  const winner = game.homeScore>game.awayScore?game.homeTeam:game.awayTeam;
+  const margin = Math.abs((game.homeScore||0)-(game.awayScore||0));
+
+  return (
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:16,marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:12,marginBottom:6}}>
+        <TeamLogo src={game.awayLogo} name={game.awayTeam} size={36}/>
+        <span style={{fontSize:22,fontWeight:900,color:C.text}}>
+          <span style={{color:game.awayScore>game.homeScore?C.orange:C.text}}>{game.awayScore}</span>
+          <span style={{color:C.muted,margin:"0 6px"}}>–</span>
+          <span style={{color:game.homeScore>game.awayScore?C.orange:C.text}}>{game.homeScore}</span>
+        </span>
+        <TeamLogo src={game.homeLogo} name={game.homeTeam} size={36}/>
+      </div>
+      <div style={{textAlign:"center",color:C.muted,fontSize:12,marginBottom:14}}>
+        {game.gameNumber?`Game ${game.gameNumber} · `:""}{game.awayTeam} @ {game.homeTeam} · {game.dateLabel}
+      </div>
+
+      {loading&&(
+        <div style={{textAlign:"center",padding:"20px 0",color:C.muted}}>
+          <div style={{width:28,height:28,border:`3px solid ${C.orange}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 10px"}}/>
+          <div style={{fontSize:13}}>Generating game recap...</div>
+        </div>
+      )}
+
+      {text&&(
+        <div style={{background:"rgba(255,107,0,.05)",border:`1px solid rgba(255,107,0,.15)`,borderRadius:10,padding:"14px 15px",fontSize:14,lineHeight:1.8,color:C.text,marginBottom:8}}>
+          {text}
+        </div>
+      )}
+
+      {!text&&!loading&&(
+        <div style={{textAlign:"center",padding:"12px 0",color:C.muted,fontSize:13}}>
+          Recap will load automatically...
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════ PREDICTION TAB ═══════════ */
+function PredictionPanel({games,homeTeam,awayTeam,homeWins,awayWins,homeLogo,awayLogo}) {
+  const [text,setText]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const lastGameCount=useRef(-1);
+  const completedCount=games.filter(g=>g.status==="FINAL").length;
+
+  useEffect(()=>{
+    if(completedCount!==lastGameCount.current&&homeTeam&&awayTeam){
+      lastGameCount.current=completedCount;
+      setLoading(true); setText(null);
+      generatePrediction(games,homeTeam,awayTeam,homeWins,awayWins)
+        .then(t=>{setText(t);setLoading(false);})
+        .catch(()=>setLoading(false));
+    }
+  },[completedCount,homeTeam,awayTeam,homeWins,awayWins,games]);
+
+  const champion = homeWins===4||awayWins===4;
+
+  return (
+    <div>
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:16,marginBottom:16}}>
+        <div style={{fontSize:11,color:C.orange,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:14}}>
+          🏀 {champion?"Series Analysis":"AI Series Prediction"}
+        </div>
+
+        <div style={{display:"flex",justifyContent:"center",gap:24,marginBottom:16}}>
+          {[{logo:awayLogo,name:awayTeam,wins:awayWins},{logo:homeLogo,name:homeTeam,wins:homeWins}].map(({logo,name,wins})=>(
+            <div key={name} style={{textAlign:"center"}}>
+              <TeamLogo src={logo} name={name} size={48}/>
+              <div style={{fontSize:12,fontWeight:700,color:C.text,marginTop:6}}>{name}</div>
+              <div style={{fontSize:22,fontWeight:900,color:wins===4?C.orange:C.muted,marginTop:2}}>{wins}</div>
+              <div style={{fontSize:10,color:C.muted}}>win{wins!==1?"s":""}</div>
+            </div>
+          ))}
+        </div>
+
+        {loading&&(
+          <div style={{textAlign:"center",padding:"20px 0",color:C.muted}}>
+            <div style={{width:28,height:28,border:`3px solid ${C.orange}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 10px"}}/>
+            <div style={{fontSize:13}}>{champion?"Building series analysis...":"Analyzing the series..."}</div>
+          </div>
+        )}
+
+        {text&&(
+          <div style={{background:"rgba(255,107,0,.05)",border:`1px solid rgba(255,107,0,.15)`,borderRadius:10,padding:"14px 15px",fontSize:14,lineHeight:1.8,color:C.text}}>
+            {text}
+          </div>
+        )}
+
+        {!text&&!loading&&games.length===0&&(
+          <div style={{textAlign:"center",color:C.muted,fontSize:13,padding:"12px 0"}}>
+            Loading series data...
+          </div>
+        )}
+
+        {text&&(
+          <div style={{textAlign:"center",fontSize:10,color:C.muted,marginTop:8}}>
+            ✨ AI analysis · Updates after each game
+          </div>
+        )}
+      </div>
+
+      {/* Past games mini summary */}
+      {games.filter(g=>g.status==="FINAL").length>0&&(
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:16}}>
+          <div style={{fontSize:11,color:C.orange,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:12}}>
+            📊 Series Results
+          </div>
+          {games.filter(g=>g.status==="FINAL").map((g,i)=>{
+            const winner=g.homeScore>g.awayScore?g.homeTeam:g.awayTeam;
+            return (
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:i<games.filter(x=>x.status==="FINAL").length-1?`1px solid ${C.border}`:"none"}}>
+                <span style={{fontSize:12,color:C.muted,fontWeight:600}}>Game {g.gameNumber||i+1}</span>
+                <span style={{fontSize:13,fontWeight:700,color:C.text}}>
+                  <span style={{color:g.awayScore>g.homeScore?C.orange:C.text}}>{g.awayScore}</span>
+                  <span style={{color:C.muted,margin:"0 6px"}}>–</span>
+                  <span style={{color:g.homeScore>g.awayScore?C.orange:C.text}}>{g.homeScore}</span>
+                </span>
+                <span style={{fontSize:11,color:C.orange,fontWeight:600}}>{winner} win</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════ MAIN APP ═══════════ */
+function App() {
+  const [tab,setTab]=useState("schedule");
+  const [games,setGames]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [lastUpdate,setLastUpdate]=useState(null);
+  const [isLive,setIsLive]=useState(false);
+  const timerRef=useRef(null);
+
+  const loadGames = useCallback(async(silent=false)=>{
+    if(!silent) setLoading(true);
+    try {
+      const res = await fetch(`${ESPN_BASE}/scoreboard?groups=50&limit=20`);
+      const data = await res.json();
+      const events = (data.events||[]).filter(e=>{
+        const name=(e.name||e.shortName||"").toLowerCase();
+        const comp=e.competitions?.[0];
+        return comp?.series!=null || name.includes("final");
+      });
+      if(events.length>0){
+        const parsed=events.map(parseEvent).sort((a,b)=>new Date(a.date)-new Date(b.date));
+        setGames(parsed);
+        const hasLive=parsed.some(g=>g.status==="LIVE");
+        setIsLive(hasLive);
+      }
+      setLastUpdate(new Date().toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",timeZone:"America/Chicago"}));
+    } catch(e){
+      console.error(e);
+    } finally {
+      if(!silent) setLoading(false);
+    }
+  },[]);
+
+  useEffect(()=>{
+    loadGames();
+    timerRef.current=setInterval(()=>loadGames(true), isLive?30000:120000);
+    return ()=>clearInterval(timerRef.current);
+  },[loadGames,isLive]);
+
+  // Derive series info
+  const firstGame=games[0];
+  const homeTeam=firstGame?.homeTeam||"";
+  const awayTeam=firstGame?.awayTeam||"";
+  const homeLogo=firstGame?.homeLogo||"";
+  const awayLogo=firstGame?.awayLogo||"";
+
+  let homeWins=0,awayWins=0;
+  games.forEach(g=>{
+    if(g.status==="FINAL"){
+      if(g.homeScore>g.awayScore) homeWins++;
+      else if(g.awayScore>g.homeScore) awayWins++;
+    }
+  });
+
+  const completedGames=games.filter(g=>g.status==="FINAL");
+  const upcomingGames=games.filter(g=>g.status==="UPCOMING");
+  const liveGame=games.find(g=>g.status==="LIVE");
+
+  const TABS=[
+    {id:"schedule",label:"📅 Schedule"},
+    {id:"recaps",label:"📰 Recaps"},
+    {id:"prediction",label:"🏆 Prediction"},
+  ];
+
+  return (
+    <div style={{background:C.bg,minHeight:"100vh",maxWidth:600,margin:"0 auto",color:C.text,fontFamily:"'Segoe UI',system-ui,sans-serif"}}>
+
+      {/* HEADER */}
+      <div style={{background:"linear-gradient(180deg,#1E1000,#0E0A00)",borderBottom:`3px solid ${C.orange}`,padding:"20px 16px 14px",position:"sticky",top:0,zIndex:10}}>
+        <div style={{textAlign:"center",marginBottom:10}}>
+          <div style={{fontSize:11,color:C.gold,letterSpacing:3,fontWeight:700,textTransform:"uppercase"}}>
+            {isLive?(
+              <span>🔴 <span style={{animation:"pulse 1.5s infinite",display:"inline-block"}}>GAME IN PROGRESS</span></span>
+            ):"NBA Finals 2025"}
+          </div>
+          <div style={{fontSize:26,fontWeight:900,letterSpacing:-0.5,marginTop:2}}>🏀 Finals Tracker</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:2,letterSpacing:1}}>
+            {homeTeam&&awayTeam?`${awayTeam} vs ${homeTeam}`:"Loading series..."}
+          </div>
+        </div>
+        <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:8,marginTop:6}}>
+          <div style={{width:6,height:6,borderRadius:"50%",background:isLive?C.red:C.orange,animation:isLive?"pulse 1s infinite":""}}/>
+          <span style={{fontSize:10,color:isLive?C.red:C.muted}}>
+            {isLive?"Live · Auto-refreshes every 30s":lastUpdate?`Updated ${lastUpdate} CDT`:"Loading..."}
+          </span>
+          <button onClick={()=>loadGames()} style={{background:"none",border:"none",color:C.blue,fontSize:10,cursor:"pointer",textDecoration:"underline",fontFamily:"inherit"}}>Refresh</button>
+        </div>
+      </div>
+
+      {/* TABS */}
+      <div style={{display:"flex",background:"#130D00",borderBottom:`1px solid ${C.border}`}}>
+        {TABS.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,padding:"13px 4px",background:"none",border:"none",borderBottom:tab===t.id?`3px solid ${C.orange}`:"3px solid transparent",color:tab===t.id?C.orange:C.muted,fontWeight:tab===t.id?700:400,fontSize:13,cursor:"pointer"}}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* CONTENT */}
+      <div style={{padding:16}}>
+
+        {loading&&(
+          <div style={{textAlign:"center",padding:"70px 20px",color:C.muted}}>
+            <div style={{width:40,height:40,border:`4px solid ${C.orange}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 16px"}}/>
+            <div style={{fontSize:15,fontWeight:600}}>Loading Finals data...</div>
+          </div>
+        )}
+
+        {!loading&&(
+          <>
+            {/* Series header on all tabs */}
+            {homeTeam&&<SeriesHeader games={games} homeTeam={homeTeam} awayTeam={awayTeam} homeWins={homeWins} awayWins={awayWins} homeLogo={homeLogo} awayLogo={awayLogo}/>}
+
+            {/* SCHEDULE */}
+            {tab==="schedule"&&(
+              <div>
+                {liveGame&&(
+                  <div style={{background:"rgba(255,59,48,.08)",border:`1px solid rgba(255,59,48,.3)`,borderRadius:12,padding:"10px 14px",marginBottom:12,textAlign:"center",fontSize:12,color:C.red,fontWeight:600,animation:"pulse 2s infinite"}}>
+                    🔴 GAME IN PROGRESS — score updates every 30 seconds
+                  </div>
+                )}
+                {games.length===0
+                  ?<div style={{textAlign:"center",padding:"40px",color:C.muted}}>No games found — try refreshing</div>
+                  :games.map((g,i)=><GameCard key={g.id||i} game={g}/>)}
+              </div>
+            )}
+
+            {/* RECAPS */}
+            {tab==="recaps"&&(
+              <div>
+                {completedGames.length===0
+                  ?<div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}>
+                      <div style={{fontSize:44,marginBottom:10}}>📰</div>
+                      <div style={{fontWeight:700,fontSize:16,marginBottom:6}}>No completed games yet</div>
+                      <div style={{fontSize:13}}>Recaps will appear automatically once games are final</div>
+                    </div>
+                  :completedGames.map((g,i)=><RecapCard key={g.id||i} game={g} autoLoad={true}/>)}
+              </div>
+            )}
+
+            {/* PREDICTION */}
+            {tab==="prediction"&&(
+              <PredictionPanel
+                games={games}
+                homeTeam={homeTeam}
+                awayTeam={awayTeam}
+                homeWins={homeWins}
+                awayWins={awayWins}
+                homeLogo={homeLogo}
+                awayLogo={awayLogo}
+              />
+            )}
+          </>
+        )}
+
+        {/* FOOTER */}
+        <div style={{textAlign:"center",padding:"24px 0 12px",borderTop:`1px solid ${C.border}`,marginTop:8}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:10}}>
+            Live data via ESPN · Times in CDT
+          </div>
+          <a href="https://dasoleja.github.io/worldcup2026" style={{display:"inline-block",background:"rgba(0,209,88,.1)",border:"1px solid rgba(0,209,88,.3)",borderRadius:8,padding:"8px 16px",color:"#00D158",fontSize:12,fontWeight:600,textDecoration:"none"}}>
+            ⚽ Switch to FIFA World Cup 2026 Tracker
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
